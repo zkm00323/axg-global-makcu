@@ -1,0 +1,4 @@
+﻿PyQt6==6.11.0
+pyserial==3.5
+requests==2.33.1
+esptool==5.2.0
