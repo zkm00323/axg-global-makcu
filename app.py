@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -10,6 +11,7 @@ from pathlib import Path
 
 import requests
 import serial.tools.list_ports
+import esptool
 from PyQt6.QtCore import QObject, Qt, pyqtSignal
 from PyQt6.QtWidgets import QApplication, QLabel, QMainWindow, QVBoxLayout, QWidget
 
@@ -24,6 +26,7 @@ DOWNLOAD_DIR = Path("firmware")
 BAUDRATE = "921600"
 CHIP = "esp32s3"
 FLASH_OFFSET = "0x0"
+STABLE_SECONDS = 3.0
 
 # Default mapping used by many MAKCU flashing flows.
 # Override with env vars if your left/right mapping is different.
@@ -63,6 +66,12 @@ class FlashWorker(QObject):
                 expected="any",
                 phase_label="1/5 等待 Left Flash mode 連線",
             )
+            left_device = self._wait_for_stable_flash_device(
+                left_device,
+                "1/5 等待 Left Flash mode 連線",
+                STABLE_SECONDS,
+                expected="any",
+            )
             session_left_pid = left_device.pid
             self.status.emit(
                 f"已進入 Left Flash mode: {left_device.port} (PID=0x{session_left_pid:04X})"
@@ -84,6 +93,13 @@ class FlashWorker(QObject):
                 phase_label="3/5 等待 Right Flash mode 連線（請切右側並重新插拔）",
                 exclude_signature=left_sig,
             )
+            right_device = self._wait_for_stable_flash_device(
+                right_device,
+                "3/5 等待 Right Flash mode 連線（請切右側並重新插拔）",
+                STABLE_SECONDS,
+                expected="any",
+                exclude_signature=left_sig,
+            )
             self.status.emit(
                 f"已進入 Right Flash mode: {right_device.port} (PID=0x{right_device.pid:04X})"
             )
@@ -93,7 +109,8 @@ class FlashWorker(QObject):
             self._flash_bin(right_device.port, right_bin)
             self.status.emit("Right 燒錄完成。")
 
-            self.status.emit("5/5 全部燒錄完成。")
+            self._cleanup_downloaded_bins()
+            self.status.emit("5/5 全部燒錄完成，已刪除下載檔案。")
             ok = True
         except Exception as exc:
             self.status.emit(f"流程失敗: {exc}")
@@ -202,6 +219,49 @@ class FlashWorker(QObject):
             time.sleep(0.3)
         raise RuntimeError("使用者中止")
 
+    def _wait_for_stable_flash_device(
+        self,
+        device: DeviceInfo,
+        phase_label: str,
+        stable_seconds: float,
+        expected: str = "any",
+        exclude_signature: str | None = None,
+    ) -> DeviceInfo:
+        current_device = device
+        while not self._stop_event.is_set():
+            sig = f"{current_device.port}:{current_device.vid:04X}:{current_device.pid:04X}"
+            start = time.time()
+            last_emit = 0.0
+
+            while not self._stop_event.is_set():
+                current = {
+                    f"{p.device}:{(p.vid or 0):04X}:{(p.pid or 0):04X}"
+                    for p in serial.tools.list_ports.comports()
+                    if p.vid is not None and p.pid is not None
+                }
+                if sig not in current:
+                    self.status.emit(f"{phase_label} | 偵測到連線不穩，重新等待 Flash mode...")
+                    current_device = self._wait_for_flash_device(
+                        expected=expected,
+                        phase_label=phase_label,
+                        exclude_signature=exclude_signature,
+                    )
+                    break
+
+                elapsed = time.time() - start
+                remaining = max(0.0, stable_seconds - elapsed)
+                now = time.time()
+                if now - last_emit >= 0.5:
+                    self.status.emit(
+                        f"{phase_label} | 驗證穩定連線中... {remaining:.1f}s"
+                    )
+                    last_emit = now
+                if elapsed >= stable_seconds:
+                    return current_device
+                time.sleep(0.1)
+
+        raise RuntimeError("使用者中止")
+
     def _get_current_status_text(self) -> str:
         ports = list(serial.tools.list_ports.comports())
         if not ports:
@@ -251,10 +311,7 @@ class FlashWorker(QObject):
         return target
 
     def _flash_bin(self, port: str, bin_path: Path) -> None:
-        cmd = [
-            sys.executable,
-            "-m",
-            "esptool",
+        args = [
             "--chip",
             CHIP,
             "--port",
@@ -265,29 +322,23 @@ class FlashWorker(QObject):
             FLASH_OFFSET,
             str(bin_path),
         ]
+        self.status.emit(f"開始燒錄: esptool {' '.join(args)}")
+        try:
+            esptool.main(args)
+        except SystemExit as exc:
+            code = int(exc.code) if isinstance(exc.code, int) else 1
+            if code != 0:
+                raise RuntimeError(f"esptool 失敗，exit code={code}") from exc
+        except Exception as exc:
+            raise RuntimeError(f"esptool 執行失敗: {exc}") from exc
 
-        self.status.emit(f"開始燒錄: {' '.join(cmd)}")
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            shell=False,
-        )
-
-        assert process.stdout is not None
-        for line in process.stdout:
-            line = line.strip()
-            if not line:
-                continue
-            if "Writing at" in line or "Hash of data verified" in line or "Hard resetting" in line:
-                self.status.emit(line)
-
-        code = process.wait()
-        if code != 0:
-            raise RuntimeError(f"esptool 失敗，exit code={code}")
+    def _cleanup_downloaded_bins(self) -> None:
+        if not DOWNLOAD_DIR.exists():
+            return
+        try:
+            shutil.rmtree(DOWNLOAD_DIR)
+        except Exception as exc:
+            self.status.emit(f"清理資料夾失敗: {DOWNLOAD_DIR}: {exc}")
 
 
 
