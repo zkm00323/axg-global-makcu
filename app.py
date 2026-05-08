@@ -60,10 +60,13 @@ class FlashWorker(QObject):
 
             self.status.emit("1/5 等待 Left Flash mode 連線...")
             left_device = self._wait_for_flash_device(
-                expected="left",
+                expected="any",
                 phase_label="1/5 等待 Left Flash mode 連線",
             )
-            self.status.emit(f"已進入 Left Flash mode: {left_device.port}")
+            session_left_pid = left_device.pid
+            self.status.emit(
+                f"已進入 Left Flash mode: {left_device.port} (PID=0x{session_left_pid:04X})"
+            )
 
             self.status.emit("2/5 下載 Left bin 並開始燒錄...")
             left_bin = self._download_bin(left_url, DOWNLOAD_DIR / "left.bin")
@@ -72,12 +75,18 @@ class FlashWorker(QObject):
 
             self.status.emit("3/5 等待 Right Flash mode 連線（請切右側並重新插拔）...")
             left_sig = f"{left_device.port}:{left_device.vid:04X}:{left_device.pid:04X}"
+            self._wait_for_device_disconnect(
+                left_sig,
+                "3/5 等待 Right Flash mode 連線（請先拔除 Left，再插入 Right）",
+            )
             right_device = self._wait_for_flash_device(
-                expected="right",
+                expected="any",
                 phase_label="3/5 等待 Right Flash mode 連線（請切右側並重新插拔）",
                 exclude_signature=left_sig,
             )
-            self.status.emit(f"已進入 Right Flash mode: {right_device.port}")
+            self.status.emit(
+                f"已進入 Right Flash mode: {right_device.port} (PID=0x{right_device.pid:04X})"
+            )
 
             self.status.emit("4/5 下載 Right bin 並開始燒錄...")
             right_bin = self._download_bin(right_url, DOWNLOAD_DIR / "right.bin")
@@ -137,6 +146,7 @@ class FlashWorker(QObject):
         expected: str,
         phase_label: str,
         exclude_signature: str | None = None,
+        avoid_pid: int | None = None,
     ) -> DeviceInfo:
         last_snapshot = ""
         last_emit_time = 0.0
@@ -173,6 +183,23 @@ class FlashWorker(QObject):
                 return dev
             time.sleep(0.5)
 
+        raise RuntimeError("使用者中止")
+
+    def _wait_for_device_disconnect(self, signature: str, phase_label: str) -> None:
+        last_emit = 0.0
+        while not self._stop_event.is_set():
+            current = {
+                f"{p.device}:{(p.vid or 0):04X}:{(p.pid or 0):04X}"
+                for p in serial.tools.list_ports.comports()
+                if p.vid is not None and p.pid is not None
+            }
+            if signature not in current:
+                return
+            now = time.time()
+            if now - last_emit >= 1.5:
+                self.status.emit(f"{phase_label} | 等待 Left 裝置移除中...")
+                last_emit = now
+            time.sleep(0.3)
         raise RuntimeError("使用者中止")
 
     def _get_current_status_text(self) -> str:
