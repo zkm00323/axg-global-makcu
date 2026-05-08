@@ -53,14 +53,43 @@ class FlashWorker(QObject):
         self._stop_event.set()
 
     def run(self) -> None:
-        self.status.emit("開始監控裝置狀態...")
-        while not self._stop_event.is_set():
-            try:
-                self.status.emit(self._get_current_status_text())
-            except Exception as exc:
-                self.status.emit(f"狀態讀取失敗: {exc}")
-            time.sleep(0.6)
-        self.done.emit(True)
+        ok = False
+        try:
+            left_url, right_url = self._resolve_firmware_urls()
+            DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+            self.status.emit("1/5 等待 Left Flash mode 連線...")
+            left_device = self._wait_for_flash_device(
+                expected="left",
+                phase_label="1/5 等待 Left Flash mode 連線",
+            )
+            self.status.emit(f"已進入 Left Flash mode: {left_device.port}")
+
+            self.status.emit("2/5 下載 Left bin 並開始燒錄...")
+            left_bin = self._download_bin(left_url, DOWNLOAD_DIR / "left.bin")
+            self._flash_bin(left_device.port, left_bin)
+            self.status.emit("Left 燒錄完成。")
+
+            self.status.emit("3/5 等待 Right Flash mode 連線（請切右側並重新插拔）...")
+            left_sig = f"{left_device.port}:{left_device.vid:04X}:{left_device.pid:04X}"
+            right_device = self._wait_for_flash_device(
+                expected="right",
+                phase_label="3/5 等待 Right Flash mode 連線（請切右側並重新插拔）",
+                exclude_signature=left_sig,
+            )
+            self.status.emit(f"已進入 Right Flash mode: {right_device.port}")
+
+            self.status.emit("4/5 下載 Right bin 並開始燒錄...")
+            right_bin = self._download_bin(right_url, DOWNLOAD_DIR / "right.bin")
+            self._flash_bin(right_device.port, right_bin)
+            self.status.emit("Right 燒錄完成。")
+
+            self.status.emit("5/5 全部燒錄完成。")
+            ok = True
+        except Exception as exc:
+            self.status.emit(f"流程失敗: {exc}")
+        finally:
+            self.done.emit(ok)
 
     def _validate_urls(self) -> None:
         return
@@ -120,7 +149,11 @@ class FlashWorker(QObject):
                     continue
                 if vid != ESP_FLASH_VID:
                     continue
-                if pid not in FLASH_PIDS:
+                if expected == "left" and pid != LEFT_FLASH_PID:
+                    continue
+                if expected == "right" and pid != RIGHT_FLASH_PID:
+                    continue
+                if expected == "any" and pid not in FLASH_PIDS:
                     continue
                 found.append(DeviceInfo(port=port.device, vid=vid, pid=pid, hwid=port.hwid))
 
@@ -128,15 +161,14 @@ class FlashWorker(QObject):
             snapshot = ", ".join(signatures) if signatures else "none"
             now = time.time()
             if snapshot != last_snapshot or now - last_emit_time >= 1.5:
-                self.status.emit(f"{phase_label} | 掃描中... 找到 Flash 裝置: {snapshot}")
+                current = self._get_current_status_text()
+                self.status.emit(f"{phase_label} | 掃描中... Flash 裝置: {snapshot} | {current}")
                 last_snapshot = snapshot
                 last_emit_time = now
 
             for dev in found:
                 sig = f"{dev.port}:{dev.vid:04X}:{dev.pid:04X}"
                 if exclude_signature and sig == exclude_signature:
-                    continue
-                if not self._probe_flash_port(dev.port):
                     continue
                 return dev
             time.sleep(0.5)
@@ -230,36 +262,6 @@ class FlashWorker(QObject):
         if code != 0:
             raise RuntimeError(f"esptool 失敗，exit code={code}")
 
-    def _probe_flash_port(self, port: str) -> bool:
-        cmd = [
-            sys.executable,
-            "-m",
-            "esptool",
-            "--chip",
-            CHIP,
-            "--port",
-            port,
-            "--baud",
-            BAUDRATE,
-            "chip_id",
-        ]
-        try:
-            proc = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                shell=False,
-                timeout=12,
-            )
-            output = proc.stdout or ""
-            if proc.returncode == 0 and ("Chip is" in output or "Detected" in output):
-                return True
-            return False
-        except Exception:
-            return False
 
 
 class MainWindow(QMainWindow):
